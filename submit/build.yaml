@@ -1,4 +1,3 @@
-# cloudformation solution goes here
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   DS5220 Data Project 1 - Anomaly Detection Pipeline.
@@ -9,7 +8,7 @@ Parameters:
   MyIP:
     Type: String
     Default: "199.111.224.43/32"
-    Description: Your local IP address for SSH access (CIDR notation)
+    Description: Local IP address for SSH access (CIDR notation)
 
   BucketName:
     Type: String
@@ -19,11 +18,16 @@ Parameters:
   GitHubRepo:
     Type: String
     Default: "https://github.com/mauriciotorres-ds/anomaly-detection"
-    Description: URL of the forked anomaly-detection repository
+    Description: URL of your forked anomaly-detection repository
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: "ds5220-dp1-key"
+    Description: Name of the existing EC2 key pair for SSH access
+
 
 # Resources
 Resources:
-
 
   # S3 Bucket
   AnomalyBucket:
@@ -67,6 +71,7 @@ Resources:
             Condition:
               ArnLike:
                 aws:SourceArn: !Sub "arn:aws:s3:::${BucketName}"
+
 
   # SNS Subscription (HTTP to EC2 /notify endpoint)
   SNSSubscription:
@@ -129,13 +134,15 @@ Resources:
           CidrIp: "0.0.0.0/0"
           Description: "FastAPI from anywhere"
 
+
   # EC2 Instance
   AnomalyEC2Instance:
     Type: AWS::EC2::Instance
     Properties:
-      # Ubuntu 24.04 LTS (us-east-1) - ami-0c7217cdde317cfec
+      # Ubuntu 24.04 LTS (us-east-1)
       ImageId: "ami-0c7217cdde317cfec"
       InstanceType: "t3.micro"
+      KeyName: !Ref KeyName
       IamInstanceProfile: !Ref EC2InstanceProfile
       SecurityGroups:
         - !Ref AnomalySecurityGroup
@@ -188,6 +195,7 @@ Resources:
             systemctl enable anomaly-detection
             systemctl start anomaly-detection
 
+
   # Elastic IP and Association
   ElasticIP:
     Type: AWS::EC2::EIP
@@ -199,6 +207,7 @@ Resources:
     Properties:
       InstanceId: !Ref AnomalyEC2Instance
       EIP: !Ref ElasticIP
+
 
 # Outputs
 Outputs:
