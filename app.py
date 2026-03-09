@@ -1,10 +1,11 @@
-# app.py
 import io
 import json
 import os
 import boto3
 import pandas as pd
 import requests
+# logging - importing logging module to write events to a local file
+import logging
 from datetime import datetime
 from fastapi import FastAPI, BackgroundTasks, Request
 from baseline import BaselineManager
@@ -14,6 +15,15 @@ app = FastAPI(title="Anomaly Detection Pipeline")
 
 s3 = boto3.client("s3")
 BUCKET_NAME = os.environ["BUCKET_NAME"]
+
+# logging - setting up the logger to write to a local file on the instance
+logging.basicConfig(
+    filename="/opt/anomaly-detection/app.log",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S"
+)
+logger = logging.getLogger(__name__)
 
 # ── SNS subscription confirmation + message handler ──────────────────────────
 
@@ -25,6 +35,8 @@ async def handle_sns(request: Request, background_tasks: BackgroundTasks):
         body = await request.json()
     except Exception as e:
         print(f"[ERROR] couldn't parse request body: {e}")
+        # logging - log parse errors so we can trace bad incoming requests
+        logger.error(f"couldn't parse request body: {e}")
         return {"status": "error", "message": "invalid JSON body"}
 
     msg_type = request.headers.get("x-amz-sns-message-type")
@@ -37,9 +49,13 @@ async def handle_sns(request: Request, background_tasks: BackgroundTasks):
             confirm_url = body["SubscribeURL"]
             requests.get(confirm_url, timeout=10)
             print(f"[INFO] SNS subscription confirmed: {confirm_url}")
+            # logging - record when the SNS subscription gets confirmed
+            logger.info(f"SNS subscription confirmed: {confirm_url}")
             return {"status": "confirmed"}
         except Exception as e:
             print(f"[ERROR] failed to confirm SNS subscription: {e}")
+            # logging - log confirmation failures so we know if SNS never connected
+            logger.error(f"failed to confirm SNS subscription: {e}")
             return {"status": "error", "message": str(e)}
 
     if msg_type == "Notification":
@@ -50,9 +66,13 @@ async def handle_sns(request: Request, background_tasks: BackgroundTasks):
                 key = record["s3"]["object"]["key"]
                 if key.startswith("raw/") and key.endswith(".csv"):
                     print(f"[INFO] new file received, queuing for processing: {key}")
+                    # logging - log each new file arrival so we have a record of every batch
+                    logger.info(f"new file received, queuing for processing: {key}")
                     background_tasks.add_task(process_file, BUCKET_NAME, key)
         except Exception as e:
             print(f"[ERROR] failed to handle SNS notification: {e}")
+            # logging - log notification failures so we can trace dropped events
+            logger.error(f"failed to handle SNS notification: {e}")
             return {"status": "error", "message": str(e)}
 
     return {"status": "ok"}
@@ -91,16 +111,22 @@ def get_recent_anomalies(limit: int = 50):
                     all_anomalies.append(flagged)
             except Exception as e:
                 print(f"[ERROR] couldn't read processed file {key}: {e}")
+                # logging - log individual file read failures
+                logger.error(f"couldn't read processed file {key}: {e}")
                 continue
 
         if not all_anomalies:
             return {"count": 0, "anomalies": []}
 
         combined = pd.concat(all_anomalies).head(limit)
+        # logging - log how many anomalies were returned for this query
+        logger.info(f"recent anomalies query returned {len(combined)} rows")
         return {"count": len(combined), "anomalies": combined.to_dict(orient="records")}
 
     except Exception as e:
         print(f"[ERROR] failed to retrieve recent anomalies: {e}")
+        # logging - log top level failures on this endpoint
+        logger.error(f"failed to retrieve recent anomalies: {e}")
         return {"error": str(e)}
 
 
@@ -123,6 +149,8 @@ def get_anomaly_summary():
                         summaries.append(json.loads(response["Body"].read()))
                     except Exception as e:
                         print(f"[ERROR] couldn't read summary file {obj['Key']}: {e}")
+                        # logging - log which summary files failed to load
+                        logger.error(f"couldn't read summary file {obj['Key']}: {e}")
                         continue
 
         if not summaries:
@@ -131,6 +159,8 @@ def get_anomaly_summary():
         total_rows = sum(s["total_rows"] for s in summaries)
         total_anomalies = sum(s["anomaly_count"] for s in summaries)
 
+        # logging - log the aggregated summary stats each time this endpoint is hit
+        logger.info(f"anomaly summary: {len(summaries)} files, {total_rows} rows, {total_anomalies} anomalies")
         return {
             "files_processed": len(summaries),
             "total_rows_scored": total_rows,
@@ -141,6 +171,8 @@ def get_anomaly_summary():
 
     except Exception as e:
         print(f"[ERROR] failed to retrieve anomaly summary: {e}")
+        # logging - log top level failures on this endpoint
+        logger.error(f"failed to retrieve anomaly summary: {e}")
         return {"error": str(e)}
 
 
@@ -167,8 +199,12 @@ def get_current_baseline():
                 }
             except Exception as e:
                 print(f"[ERROR] couldn't parse stats for channel {channel}: {e}")
+                # logging - log which channels had bad stats
+                logger.error(f"couldn't parse stats for channel {channel}: {e}")
                 continue
 
+        # logging - log baseline retrieval so we can track how often it's being checked
+        logger.info(f"baseline retrieved: {len(channels)} channels")
         return {
             "last_updated": baseline.get("last_updated"),
             "channels": channels,
@@ -176,9 +212,13 @@ def get_current_baseline():
 
     except Exception as e:
         print(f"[ERROR] failed to retrieve baseline: {e}")
+        # logging - log top level failures on this endpoint
+        logger.error(f"failed to retrieve baseline: {e}")
         return {"error": str(e)}
 
 
 @app.get("/health")
 def health():
+    # logging - log each health check so we have a heartbeat trail in the log file
+    logger.info("health check called")
     return {"status": "ok", "bucket": BUCKET_NAME, "timestamp": datetime.utcnow().isoformat()}
