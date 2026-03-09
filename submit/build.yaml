@@ -1,1 +1,223 @@
 # cloudformation solution goes here
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DS5220 Data Project 1 - Anomaly Detection Pipeline.
+  Provisions EC2, S3, IAM role, Security Group, Elastic IP, SNS topic, and S3 event notification.
+
+# Parameters
+Parameters:
+  MyIP:
+    Type: String
+    Default: "199.111.224.43/32"
+    Description: Your local IP address for SSH access (CIDR notation)
+
+  BucketName:
+    Type: String
+    Default: "ds5220-dp1-anomaly-detection"
+    Description: Name of the S3 bucket for raw uploads, processed output, state, and logs
+
+  GitHubRepo:
+    Type: String
+    Default: "https://github.com/mauriciotorres-ds/anomaly-detection"
+    Description: URL of the forked anomaly-detection repository
+
+# Resources
+Resources:
+
+
+  # S3 Bucket
+  AnomalyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "raw/"
+                  - Name: suffix
+                    Value: ".csv"
+            Topic: !Ref SNSTopic
+    DependsOn: SNSTopicPolicy
+
+  # SNS Topic
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "ds5220-dp1"
+
+  # SNS Topic Policy - allows S3 to publish to this topic
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3ToPublish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SNSTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${BucketName}"
+
+  # SNS Subscription (HTTP to EC2 /notify endpoint)
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SNSTopic
+      Protocol: http
+      Endpoint: !Sub "http://${ElasticIP}:8000/notify"
+    DependsOn: ElasticIP
+
+  # IAM Role and Instance Profile
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "ds5220-dp1-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "ds5220-dp1-s3-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}"
+                  - !Sub "arn:aws:s3:::${BucketName}/*"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: "ds5220-dp1-instance-profile"
+      Roles:
+        - !Ref EC2Role
+
+  # Security Group
+  AnomalySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "DS5220 DP1 - Allow SSH from my IP and port 8000 from anywhere"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyIP
+          Description: "SSH from my IP only"
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: "0.0.0.0/0"
+          Description: "FastAPI from anywhere"
+
+  # EC2 Instance
+  AnomalyEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      # Ubuntu 24.04 LTS (us-east-1) - ami-0c7217cdde317cfec
+      ImageId: "ami-0c7217cdde317cfec"
+      InstanceType: "t3.micro"
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroups:
+        - !Ref AnomalySecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            set -e
+
+            # ---- System update and dependencies ----
+            apt-get update -y
+            apt-get install -y git python3 python3-pip python3-venv
+
+            # ---- Set BUCKET_NAME globally and for this session ----
+            echo 'BUCKET_NAME="${BucketName}"' >> /etc/environment
+            export BUCKET_NAME="${BucketName}"
+
+            # ---- Clone the forked repo ----
+            git clone ${GitHubRepo} /opt/anomaly-detection
+
+            # ---- Create virtual environment and install dependencies ----
+            python3 -m venv /opt/anomaly-detection/venv
+            /opt/anomaly-detection/venv/bin/pip install --upgrade pip
+            /opt/anomaly-detection/venv/bin/pip install -r /opt/anomaly-detection/requirements.txt
+
+            # ---- Create a systemd service so FastAPI starts on boot ----
+            cat <<EOF > /etc/systemd/system/anomaly-detection.service
+            [Unit]
+            Description=Anomaly Detection FastAPI Service
+            After=network.target
+
+            [Service]
+            User=root
+            WorkingDirectory=/opt/anomaly-detection
+            EnvironmentFile=/etc/environment
+            ExecStart=/opt/anomaly-detection/venv/bin/fastapi run /opt/anomaly-detection/app.py
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable anomaly-detection
+            systemctl start anomaly-detection
+
+  # Elastic IP and Association
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  ElasticIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref AnomalyEC2Instance
+      EIP: !Ref ElasticIP
+
+# Outputs
+Outputs:
+  InstancePublicIP:
+    Description: "Elastic IP of the EC2 instance"
+    Value: !Ref ElasticIP
+
+  APIEndpoint:
+    Description: "FastAPI base URL"
+    Value: !Sub "http://${ElasticIP}:8000"
+
+  NotifyEndpoint:
+    Description: "SNS subscription endpoint"
+    Value: !Sub "http://${ElasticIP}:8000/notify"
+
+  S3BucketName:
+    Description: "S3 bucket name"
+    Value: !Ref BucketName
+
+  SNSTopicArn:
+    Description: "SNS topic ARN"
+    Value: !Ref SNSTopic
